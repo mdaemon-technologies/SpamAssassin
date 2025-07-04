@@ -80,6 +80,9 @@ param(
 $ScriptBlock = {
     param($MSGFile, $RemoteHost, $Port, $GetResponseThreadedFunction, $ProcessBufferThreadedFunction, $EnableDebug, $LogResponses, $LogPath)
 
+    # Start stopwatch as the very first operation
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
     # Import functions into runspace only once
     if (-not (Get-Command GetResponseThreaded -ErrorAction SilentlyContinue)) {
         Set-Item -Path function:GetResponseThreaded -Value ([ScriptBlock]::Create($GetResponseThreadedFunction)) -Force
@@ -105,7 +108,6 @@ $ScriptBlock = {
         ThreadLog = @()
     }
 
-    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     try {
         if ($EnableDebug) { $result.ThreadLog += "Processing: $($MSGFile.Name)" }
 
@@ -167,7 +169,7 @@ $ScriptBlock = {
         $stopwatch.Stop()
         $result.ProcessingTime = $stopwatch.ElapsedMilliseconds
     }
-    return $result
+    return [PSCustomObject]$result
 }
 
 function GetResponseThreaded($NetStream, $EnableDebug = $false, $result = $null) {
@@ -233,7 +235,11 @@ function ProcessBufferThreaded($outputBuffer, $EnableDebug = $false, $result = $
         TopRules = ""
         DebugInfo = ""
     }
-    if ($outputBuffer -match "Message-Id:\s*(.*)" -or $outputBuffer -match "Message-ID:\s*(.*)") { $parseResult.MSGID = $Matches[1].Trim() }
+    
+    if ($outputBuffer -match "Message-Id:\s*(.*)" -or $outputBuffer -match "Message-ID:\s*(.*)") { 
+        $parseResult.MSGID = $Matches[1].Trim() 
+    }
+    
     if ($headers -match "Spam:\s*(.*)") {
         $spamLine = $Matches[1].Trim()
         if ($spamLine -match "([^;]+);\s*([\d.-]+)\s*/\s*([\d.-]+)") {
@@ -242,297 +248,388 @@ function ProcessBufferThreaded($outputBuffer, $EnableDebug = $false, $result = $
             $parseResult.Threshold = $Matches[3].Trim()
         }
     }
+    
     if ($body -and $body.Length -gt 0) {
-        if ($body -match "(?s)Content analysis details:.*?pts rule name.*?description.*?-+\s*(.*?)(?:\n\s*\n|\r\n\s*\r\n|$)") {
-            $analysisSection = $Matches[1]
-            $rulePattern = "^\s*([\d.-]+)\s+([A-Z_][A-Z0-9_]*)\s+(.*?)$"
-            $ruleLines = $analysisSection -split "`n" | Where-Object { $_.Trim() -and $_ -notmatch "^\s*-+\s*$" }
-            $detailedRules = @()
-            foreach ($line in $ruleLines) {
-                $cleanLine = $line.Trim()
-                if ($cleanLine -match $rulePattern) {
-                    $score = [decimal]$Matches[1]
-                    $ruleName = $Matches[2].Trim()
-                    $description = $Matches[3].Trim()
-                    $detailedRules += [PSCustomObject]@{ Score = $score; Rule = $ruleName; Description = $description }
+        # Use substring approach instead of complex regex
+        $analysisMarker = "Content analysis details:"
+        $analysisStart = $body.IndexOf($analysisMarker)
+        
+        if ($analysisStart -ge 0) {
+            # Find the header line with "pts rule name description"
+            $headerMarker = "pts rule name"
+            $headerStart = $body.IndexOf($headerMarker, $analysisStart)
+            
+            if ($headerStart -ge 0) {
+                # Find the line after the dashes (the actual rules start)
+                $bodyAfterHeader = $body.Substring($headerStart)
+                $lines = $bodyAfterHeader -split "`r?`n"
+                
+                # Find where the actual rule data starts (after the dashes)
+                $ruleStartIndex = -1
+                for ($i = 0; $i -lt $lines.Length; $i++) {
+                    if ($lines[$i] -match "^[\s-]+$") {
+                        $ruleStartIndex = $i + 1
+                        break
+                    }
                 }
-            }
-            if ($detailedRules.Count -gt 0) {
-                $sortedRules = $detailedRules | Sort-Object Score -Descending
-                $parseResult.RuleHits = $sortedRules | ForEach-Object { "$($_.Rule)($($_.Score))" }
-                $parseResult.RuleCount = $detailedRules.Count
-                $parseResult.TopRules = ($sortedRules | Select-Object -First 5 | ForEach-Object { "$($_.Rule)($($_.Score))" }) -join ", "
-            }
-        } else {
-            $ruleMatches = [regex]::Matches($body, "^\s*([\d.-]+)\s+([A-Z_][A-Z0-9_]{2,})\s+.*$", [System.Text.RegularExpressions.RegexOptions]::Multiline)
-            if ($ruleMatches.Count -gt 0) {
-                $fallbackRules = @()
-                foreach ($match in $ruleMatches) {
-                    $score = [decimal]$match.Groups[1].Value
-                    $ruleName = $match.Groups[2].Value.Trim()
-                    $fallbackRules += [PSCustomObject]@{ Score = $score; Rule = $ruleName; Description = "Parsed from fallback method" }
-                }
-                if ($fallbackRules.Count -gt 0) {
-                    $sortedRules = $fallbackRules | Sort-Object Score -Descending
-                    $parseResult.RuleHits = $sortedRules | ForEach-Object { "$($_.Rule)($($_.Score))" }
-                    $parseResult.RuleCount = $fallbackRules.Count
-                    $parseResult.TopRules = ($sortedRules | Select-Object -First 5 | ForEach-Object { "$($_.Rule)($($_.Score))" }) -join ", "
+                
+                if ($ruleStartIndex -ge 0 -and $ruleStartIndex -lt $lines.Length) {
+                    $detailedRules = @()
+                    # Process rule lines
+                    for ($i = $ruleStartIndex; $i -lt $lines.Length; $i++) {
+                        $line = $lines[$i].Trim()
+                        
+                        # Stop if we hit an empty line or end of rules
+                        if ([string]::IsNullOrWhiteSpace($line)) {
+                            break
+                        }
+                        
+                        # Parse the rule line: score, rule name, description
+                        if ($line -match "^\s*([\d.-]+)\s+([A-Z_][A-Z0-9_]*)\s+(.*)$") {
+                            $score = [decimal]$Matches[1]
+                            $ruleName = $Matches[2].Trim()
+                            $description = $Matches[3].Trim()
+                            
+                            $detailedRules += [PSCustomObject]@{ 
+                                Score = $score
+                                Rule = $ruleName
+                                Description = $description 
+                            }
+                        }
+                    }
+                    
+                    if ($detailedRules.Count -gt 0) {
+                        $sortedRules = $detailedRules | Sort-Object Score -Descending
+                        $parseResult.RuleHits = $sortedRules
+                        $parseResult.RuleCount = $detailedRules.Count
+                        $parseResult.TopRules = ($sortedRules | Select-Object -First 5 | ForEach-Object { "$($_.Rule)($($_.Score))" }) -join ", "
+                    }
                 }
             }
         }
     }
-    if ([string]::IsNullOrEmpty($parseResult.Score) -and $headers -match "X-Spam-Score:\s*([\d.-]+)") { $parseResult.Score = $Matches[1] }
-    if ([string]::IsNullOrEmpty($parseResult.Threshold) -and $headers -match "X-Spam-(?:Level|Threshold):\s*([\d.-]+)") { $parseResult.Threshold = $Matches[1] }
+    
+    # Fallback parsing
+    if ([string]::IsNullOrEmpty($parseResult.Score) -and $headers -match "X-Spam-Score:\s*([\d.-]+)") { 
+        $parseResult.Score = $Matches[1] 
+    }
+    if ([string]::IsNullOrEmpty($parseResult.Threshold) -and $headers -match "X-Spam-(?:Level|Threshold):\s*([\d.-]+)") { 
+        $parseResult.Threshold = $Matches[1] 
+    }
     if ([string]::IsNullOrEmpty($parseResult.Result) -and $headers -match "SPAMD/[\d.]+\s+(\d+)\s+(.*)") {
         $code = $Matches[1]; $message = $Matches[2].Trim()
         if ($code -ne "0") { $parseResult.Result = "Error: Code $code - $message" }
     }
+    
     return $parseResult
 }
 
-# MAIN EXECUTION
-Write-Host "=== Multi-threaded SPAMC Email Processor with Rule Tracking ===" -ForegroundColor Cyan
-Write-Host "Path: $MSGPath"
-Write-Host "Host: ${RemoteHost}:${Port}"
-Write-Host "Max Concurrent Jobs: $MaxConcurrentJobs"
-if($EnableDebug) { Write-Host "Debug Mode: Enabled" -ForegroundColor Yellow }
-if($LogResponses) { 
-    $actualLogPath = if($LogPath) { Join-Path $LogPath "spamc_responses.log" } else { Join-Path (Get-Location) "spamc_responses.log" }
-    Write-Host "Response Logging: Enabled -> $actualLogPath" -ForegroundColor Yellow 
-}
-if($ExportCSV) {
-    $exportLocation = if($LogPath) { $LogPath } else { Get-Location }
-    Write-Host "CSV Export: Enabled -> $exportLocation" -ForegroundColor Yellow
-}
-Write-Host ""
+# ---[ Utility Functions ]---
+function Write-Log {
+    param(
+        [string]$Message,
+        [string]$Level = "Info",
+        [ConsoleColor]$Color = [ConsoleColor]::White
+    )
 
-# Get function definitions
-$GetResponseThreadedFunction = ${function:GetResponseThreaded}.ToString()
-$ProcessBufferThreadedFunction = ${function:ProcessBufferThreaded}.ToString()
+    # Use script scope to access the EnableDebug parameter
+    if (-not $script:EnableDebug -and $Level -eq "Debug") { 
+        return 
+    }
 
-# Get MSG files
-$AllMSGFiles = Get-ChildItem -Path $MSGPath -Filter *.msg -ErrorAction SilentlyContinue
-
-if(-not $AllMSGFiles -or $AllMSGFiles.Count -eq 0) {
-    Write-Warning "No .msg files found in $MSGPath"
-    Write-Host "Please check the path and ensure .msg files exist."
-    exit
+    Write-Host "$Message" -ForegroundColor $Color
 }
 
-$TotalFileCount = $AllMSGFiles.Count
-Write-Host "Found $TotalFileCount MSG files to process" -ForegroundColor Green
-
-# Create a thread-safe queue for the files
-$FileQueue = [System.Collections.Concurrent.ConcurrentQueue[System.IO.FileInfo]]::new()
-foreach ($file in $AllMSGFiles) {
-    $FileQueue.Enqueue($file)
+function Get-ExportDirectory {
+    param([string]$LogPath)
+    if ($LogPath) { return $LogPath }
+    return (Get-Location)
 }
 
-# Create runspace pool
-$RunspacePool = [runspacefactory]::CreateRunspacePool(1, $MaxConcurrentJobs)
-$RunspacePool.Open()
+function Get-ActualLogPath {
+    param([string]$LogPath)
+    if ($LogPath) { return (Join-Path $LogPath "spamc_responses.log") }
+    return (Join-Path (Get-Location) "spamc_responses.log")
+}
 
-$Jobs = @()
-$Results = [System.Collections.ArrayList]::new()
-$TotalProcessed = 0
+function Get-MSGFiles {
+    param([string]$MSGPath)
+    $files = Get-ChildItem -Path $MSGPath -Filter *.msg -ErrorAction SilentlyContinue
+    return $files
+}
 
-try {
-    # This loop manages the job queue, submitting new jobs as threads become available
-    # and collecting results from completed jobs.
-    while($TotalProcessed -lt $TotalFileCount) {
-        
-        # Submit new jobs until the runspace pool is busy or the queue is empty
-        while ($Jobs.Count -lt $MaxConcurrentJobs -and !$FileQueue.IsEmpty) {
-            $MSGFile = $null
-            if ($FileQueue.TryDequeue([ref]$MSGFile)) {
-                $PowerShell = [powershell]::Create()
-                $PowerShell.RunspacePool = $RunspacePool
-                
-                [void]$PowerShell.AddScript($ScriptBlock)
-                [void]$PowerShell.AddParameter("MSGFile", $MSGFile)
-                [void]$PowerShell.AddParameter("RemoteHost", $RemoteHost)
-                [void]$PowerShell.AddParameter("Port", $Port)
-                [void]$PowerShell.AddParameter("GetResponseThreadedFunction", $GetResponseThreadedFunction)
-                [void]$PowerShell.AddParameter("ProcessBufferThreadedFunction", $ProcessBufferThreadedFunction)
-                [void]$PowerShell.AddParameter("EnableDebug", $EnableDebug)
-                [void]$PowerShell.AddParameter("LogResponses", $LogResponses)
-                [void]$PowerShell.AddParameter("LogPath", $LogPath)
-                
-                $Job = @{
-                    PowerShell = $PowerShell
-                    Handle = $PowerShell.BeginInvoke()
-                    File = $MSGFile.Name
-                    SubmitTime = Get-Date
+function New-ThreadSafeQueue {
+    [CmdletBinding()]
+    param(
+        [Parameter(ValueFromPipeline = $true)]
+        [psobject]$InputObject
+    )
+
+    begin {
+        # Initialize the queue once before processing any items from the pipeline.
+        $queue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
+    }
+
+    process {
+        # For each object piped to the function, add it to the queue.
+        if ($null -ne $InputObject) {
+            $queue.Enqueue($InputObject)
+        }
+    }
+
+    end {
+        # After all items are processed, return the fully populated queue.
+        # Use the comma operator to prevent PowerShell from unrolling the queue's contents.
+        return ,$queue
+    }
+}
+
+function New-RunspacePool {
+    param([int]$MaxConcurrentJobs)
+    $pool = [runspacefactory]::CreateRunspacePool(1, $MaxConcurrentJobs)
+    $pool.Open()
+    return $pool
+}
+
+function Submit-Job {
+    param(
+        $ScriptBlock, $MSGFile, $RemoteHost, $Port,
+        $GetResponseThreadedFunction, $ProcessBufferThreadedFunction,
+        $EnableDebug, $LogResponses, $LogPath, $RunspacePool
+    )
+    $PowerShell = [powershell]::Create()
+    $PowerShell.RunspacePool = $RunspacePool
+    [void]$PowerShell.AddScript($ScriptBlock)
+    [void]$PowerShell.AddParameter("MSGFile", $MSGFile)
+    [void]$PowerShell.AddParameter("RemoteHost", $RemoteHost)
+    [void]$PowerShell.AddParameter("Port", $Port)
+    [void]$PowerShell.AddParameter("GetResponseThreadedFunction", $GetResponseThreadedFunction)
+    [void]$PowerShell.AddParameter("ProcessBufferThreadedFunction", $ProcessBufferThreadedFunction)
+    [void]$PowerShell.AddParameter("EnableDebug", $EnableDebug)
+    [void]$PowerShell.AddParameter("LogResponses", $LogResponses)
+    [void]$PowerShell.AddParameter("LogPath", $LogPath)
+    return @{
+        PowerShell = $PowerShell
+        Handle = $PowerShell.BeginInvoke()
+        File = $MSGFile.Name
+        SubmitTime = Get-Date
+    }
+}
+
+function Collect-CompletedJobs {
+    param($Jobs, [ref]$Results, [ref]$TotalProcessed, $EnableDebug, $TotalFileCount)
+    $CompletedJobs = $Jobs | Where-Object { $_.Handle.IsCompleted }
+    $RemainingJobs = @()
+    foreach ($Job in $Jobs) {
+        if ($Job.Handle.IsCompleted) {
+            $ResultData = $null
+            try {
+                $ResultData = $Job.PowerShell.EndInvoke($Job.Handle)
+                if ($ResultData) {
+                    [void]$Results.Value.Add($ResultData)
+                } else {
+                    $ResultData = [PSCustomObject]@{
+                        FileName = $Job.File; Success = $false; Error = "Job returned null result"; ProcessingTime = 0; RuleHits = @()
+                    }
+                    [void]$Results.Value.Add($ResultData)
                 }
-                
-                $Jobs += $Job
-                Write-Host "Submitted job for: $($MSGFile.Name)"
-            }
-        }
-        
-        # Wait for any job to complete
-        if ($Jobs.Count -gt 0) {
-            $waitHandles = $Jobs.Handle | ForEach-Object { $_.AsyncWaitHandle }
-            [void][System.Threading.WaitHandle]::WaitAny($waitHandles, 60000) # 60-second timeout
-        }
-
-        # Collect results from all completed jobs
-        $CompletedJobs = $Jobs | Where-Object { $_.Handle.IsCompleted }
-        $RemainingJobs = @()
-
-        foreach ($Job in $Jobs) {
-            if ($Job.Handle.IsCompleted) {
-                $ResultData = $null
-                try {
-                    $ResultData = $Job.PowerShell.EndInvoke($Job.Handle)
-                    if ($ResultData) {
-                        [void]$Results.Add([PSCustomObject]$ResultData)
+            } catch {
+                $ResultData = [PSCustomObject]@{
+                    FileName = $Job.File; Success = $false; Error = "Job failed: $($_.Exception.Message)"; ProcessingTime = 0; RuleHits = @()
+                }
+                [void]$Results.Value.Add($ResultData)
+            } finally {
+                $Job.PowerShell.Dispose()
+                $TotalProcessed.Value++
+                Write-Log "Completed ($($TotalProcessed.Value)/$TotalFileCount): $($Job.File)" "Info" "Gray"
+                if ($ResultData) {
+                    if ($EnableDebug -and $ResultData.ThreadLog) {
+                        $ResultData.ThreadLog | ForEach-Object { Write-Log $_ "Debug" "Gray" }
+                    }
+                    if ($ResultData.Success) {
+                        $statusMsg = "Result: '$($ResultData.Result)', Score: '$($ResultData.Score)'"
+                        if ($ResultData.RuleCount -gt 0) {
+                            $statusMsg += ", Rules: $($ResultData.RuleCount)"
+                        }
+                        Write-Log "  ✓ $statusMsg" "Info" "Green"
+                        if ($ResultData.RuleHits.Count -gt 0) {
+                            Write-Log "    Rules triggered:" "Info" "Cyan"
+                            $ResultData.RuleHits | ForEach-Object {
+                                Write-Log "      ($($_.Score)) $($_.Rule): $($_.Description)" "Info" "Cyan"
+                            }
+                        }
                     } else {
-                        # Create a failure result if EndInvoke returns null
-                        $FailedResult = [PSCustomObject]@{
-                            FileName = $Job.File; Success = $false; Error = "Job returned null result"; ProcessingTime = 0
-                        }
-                        [void]$Results.Add($FailedResult)
-                        $ResultData = $FailedResult
-                    }
-                } catch {
-                    # Create a failure result for exceptions during EndInvoke
-                    $FailedResult = [PSCustomObject]@{
-                        FileName = $Job.File; Success = $false; Error = "Job failed: $($_.Exception.Message)"; ProcessingTime = 0
-                    }
-                    [void]$Results.Add($FailedResult)
-                    $ResultData = $FailedResult
-                } finally {
-                    $Job.PowerShell.Dispose()
-                    $TotalProcessed++
-                    
-                    # Detailed real-time logging
-                    Write-Host "Completed ($TotalProcessed/$TotalFileCount): $($Job.File)"
-                    if ($ResultData) {
-                        if ($EnableDebug -and $ResultData.ThreadLog) {
-                            $ResultData.ThreadLog | ForEach-Object { Write-Host $_ -ForegroundColor Gray }
-                        }
-                        if ($ResultData.Success) {
-                            $statusMsg = "Result: '$($ResultData.Result)', Score: '$($ResultData.Score)'"
-                            if ($ResultData.RuleCount -gt 0) {
-                                $statusMsg += ", Rules: $($ResultData.RuleCount)"
-                            }
-                            Write-Host "  ✓ $statusMsg" -ForegroundColor Green
-                            
-                            if ($ResultData.RuleHits.Count -gt 0) {
-                                Write-Host "    Rules triggered:" -ForegroundColor Cyan
-                                $ResultData.RuleHits | ForEach-Object {
-                                    if ($_ -match "^([^(]+)\(([\d.-]+)\)$") {
-                                        Write-Host "      $($Matches[1]): $($Matches[2])" -ForegroundColor Cyan
-                                    } else {
-                                        Write-Host "      $_" -ForegroundColor Cyan
-                                    }
-                                }
-                            }
-                        } else {
-                            Write-Host "  ✗ Failed - Error: $($ResultData.Error)" -ForegroundColor Red
-                        }
+                        Write-Log "  ✗ Failed - Error: $($ResultData.Error)" "Error" "Red"
                     }
                 }
-            } else {
-                # If the job is not completed, keep it for the next iteration
-                $RemainingJobs += $Job
+            }
+        } else {
+            $RemainingJobs += $Job
+        }
+    }
+    return $RemainingJobs
+}
+
+function New-Configuration {
+    param(
+        [string]$MSGPath,
+        [int]$MaxConcurrentJobs,
+        [string]$RemoteHost,
+        [int]$Port,
+        [bool]$EnableDebug,
+        [bool]$LogResponses,
+        [string]$LogPath,
+        [bool]$ExportCSV
+    )
+
+    return [PSCustomObject]@{
+        MSGPath = $MSGPath
+        MaxConcurrentJobs = $MaxConcurrentJobs
+        RemoteHost = $RemoteHost
+        Port = $Port
+        EnableDebug = $EnableDebug
+        LogResponses = $LogResponses
+        LogPath = $LogPath
+        ExportCSV = $ExportCSV
+    }
+}
+
+function Show-Banner {
+    param($config)
+    Write-Log "=== Multi-threaded SPAMC Email Processor with Rule Tracking ===" "Info" "Cyan"
+    Write-Log "Path: $($config.MSGPath)" "Info" "White"
+    Write-Log "Host: $($config.RemoteHost):$($config.Port)" "Info" "White"
+    Write-Log "Max Concurrent Jobs: $($config.MaxConcurrentJobs)" "Info" "White"
+    if($config.EnableDebug) { Write-Log "Debug Mode: Enabled" "Info" "Yellow" }
+    if($config.LogResponses) { Write-Log "Response Logging: Enabled -> $(Get-ActualLogPath $config.LogPath)" "Info" "Yellow" }
+    if($config.ExportCSV) { Write-Log "CSV Export: Enabled -> $(Get-ExportDirectory $config.LogPath)" "Info" "Yellow" }
+    Write-Log "" "Info" "White"
+}
+
+function Invoke-SpamCheck {
+    param($config, $ScriptBlock)
+    
+    $GetResponseThreadedFunction = ${function:GetResponseThreaded}.ToString()
+    $ProcessBufferThreadedFunction = ${function:ProcessBufferThreaded}.ToString()
+
+    $AllMSGFiles = Get-MSGFiles $config.MSGPath
+
+    if(-not $AllMSGFiles -or $AllMSGFiles.Count -eq 0) {
+        Write-Log "No .msg files found in $($config.MSGPath)" "Warn" "Yellow"
+        Write-Log "Please check the path and ensure .msg files exist." "Info" "White"
+        return
+    }
+
+    $TotalFileCount = $AllMSGFiles.Count
+    Write-Log "Found $TotalFileCount MSG files to process" "Info" "Green"
+
+    $FileQueue = $AllMSGFiles | New-ThreadSafeQueue
+
+    $RunspacePool = New-RunspacePool $config.MaxConcurrentJobs
+
+    $Jobs = @()
+    $Results = [System.Collections.ArrayList]::new()
+    $TotalProcessed = 0
+
+    try {
+        while($TotalProcessed -lt $TotalFileCount) {
+            while ($Jobs.Count -lt $config.MaxConcurrentJobs -and -not $FileQueue.IsEmpty) {
+                $MSGFile = $null
+                if ($FileQueue.TryDequeue([ref]$MSGFile)) {
+                    $Job = Submit-Job $ScriptBlock $MSGFile $config.RemoteHost $config.Port $GetResponseThreadedFunction $ProcessBufferThreadedFunction $config.EnableDebug $config.LogResponses $config.LogPath $RunspacePool
+                    $Jobs += $Job
+                    if ($config.EnableDebug) { Write-Log "Submitted job for: $($MSGFile.Name)" "Debug" "Gray" }
+                }
+            }
+            if ($Jobs.Count -gt 0) {
+                $waitHandles = $Jobs.Handle | ForEach-Object { $_.AsyncWaitHandle }
+                if ($waitHandles.Count -gt 0) {
+                    [void][System.Threading.WaitHandle]::WaitAny($waitHandles, 60000)
+                }
+            }
+            $refResults = [ref]$Results
+            $refTotalProcessed = [ref]$TotalProcessed
+            $Jobs = Collect-CompletedJobs $Jobs $refResults $refTotalProcessed $config.EnableDebug $TotalFileCount
+            if ($Jobs.Count -eq 0 -and $FileQueue.IsEmpty) { break }
+        }
+    }
+    finally {
+        if($RunspacePool) {
+            $RunspacePool.Close()
+            $RunspacePool.Dispose()
+        }
+    }
+    return $Results
+}
+
+function Get-RuleStatistics {
+    param($FinalResults)
+
+    $successfulResults = $FinalResults | Where-Object { $_.Success -and $_.RuleHits }
+    $allRuleStats = @{}
+    $messagesWithRules = 0
+    
+    foreach($result in $successfulResults) {
+        if($result.RuleHits -and $result.RuleHits.Count -gt 0) {
+            $messagesWithRules++
+            foreach($rule in $result.RuleHits) {
+                if(-not $allRuleStats.ContainsKey($rule.Rule)) {
+                    $allRuleStats[$rule.Rule] = @{
+                        Count = 0
+                        TotalScore = 0
+                        Score = $rule.Score
+                        Description = $rule.Description
+                    }
+                }
+                $allRuleStats[$rule.Rule].Count++
+                $allRuleStats[$rule.Rule].TotalScore += $rule.Score
             }
         }
-        
-        $Jobs = $RemainingJobs
-        
-        # If no jobs completed and the queue is empty, we are done
-        if ($CompletedJobs.Count -eq 0 -and $FileQueue.IsEmpty) {
-            break
-        }
     }
-}
-finally {
-    if($RunspacePool) {
-        $RunspacePool.Close()
-        $RunspacePool.Dispose()
+    
+    return [PSCustomObject]@{
+        AllRuleStats = $allRuleStats
+        MessagesWithRules = $messagesWithRules
+        TotalMessages = $successfulResults.Count
     }
 }
 
-# Display results
-Write-Host "`n=== PROCESSING RESULTS ===" -ForegroundColor Cyan
+function Show-Results {
+    param($FinalResults, $EnableDebug, $RuleStats)
 
-if($Results.Count -gt 0) {
-    # Convert ArrayList to a standard array for processing
-    $FinalResults = $Results.ToArray()
-
-    # Main results table
-    $displayColumns = @("FileName", "Success", "Result", "Score", "RuleCount", "ProcessingTime")
+    Write-Log "`n=== PROCESSING RESULTS ===" "Info" "Cyan"
+    
+    $displayColumns = @("FileName", "Success", "Result", "Score", "RuleCount", "ProcessingTime", "TopRules")
     if($EnableDebug) {
         $displayColumns += "DebugInfo"
     }
     
     $FinalResults | Format-Table $displayColumns -AutoSize
     
-    # Rule analysis
-    Write-Host "`n=== SPAM RULE ANALYSIS ===" -ForegroundColor Cyan
+    Write-Log "`n=== SPAM RULE ANALYSIS ===" "Info" "Cyan"
     
-    $successfulResults = $FinalResults | Where-Object { $_.Success -and $_.RuleHits }
-    $allRuleStats = @{}
-    $totalMessages = $successfulResults.Count
-    $messagesWithRules = 0
-    
-    foreach($result in $successfulResults) {
-        if($result.RuleHits -and $result.RuleHits.Length -gt 0) {
-            $messagesWithRules++
-            $rules = $result.RuleHits -split ";" | ForEach-Object { $_.Trim() } | Where-Object { $_ }
-            
-            foreach($rule in $rules) {
-                # Parse rule format: "RULE_NAME(score)" or just "RULE_NAME"
-                if($rule -match "^([^(]+)\(([\d.-]+)\)$") {
-                    $ruleName = $Matches[1].Trim()
-                    $ruleScore = [decimal]$Matches[2]
-                } else {
-                    $ruleName = $rule.Trim()
-                    $ruleScore = 0
-                }
-                
-                if($ruleName -and $ruleName.Length -gt 2) {
-                    if(-not $allRuleStats.ContainsKey($ruleName)) {
-                        $allRuleStats[$ruleName] = @{
-                            Count = 0
-                            TotalScore = 0
-                            Score = 0
-                        }
-                    }
-                    
-                    $allRuleStats[$ruleName].Count++
-                    $allRuleStats[$ruleName].TotalScore += $ruleScore
-                    if($ruleScore -gt $allRuleStats[$ruleName].Score) {
-                        $allRuleStats[$ruleName].Score = $ruleScore
-                    }
-                }
-            }
-        }
-    }
-    
-    if($allRuleStats.Count -gt 0) {
-        Write-Host "Messages processed: $totalMessages"
-        Write-Host "Messages with rules: $messagesWithRules"
-        Write-Host "Unique rules found: $($allRuleStats.Count)"
+    if($RuleStats.AllRuleStats.Count -gt 0) {
+        Write-Log "Messages processed: $($RuleStats.TotalMessages)" "Info" "White"
+        Write-Log "Messages with rules: $($RuleStats.MessagesWithRules)" "Info" "White"
+        Write-Log "Unique rules found: $($RuleStats.AllRuleStats.Count)" "Info" "White"
         
-        Write-Host "`nTop 25 Triggered Rules:"
-        $allRuleStats.GetEnumerator() | 
+        Write-Log "`nTop 25 Triggered Rules:" "Info" "White"
+        $RuleStats.AllRuleStats.GetEnumerator() | 
             Sort-Object { $_.Value.Count } -Descending | 
             Select-Object -First 25 | 
             ForEach-Object {
                 [PSCustomObject]@{
                     Rule = $_.Key
                     HitCount = $_.Value.Count
-                    Frequency = "{0:P1}" -f ($_.Value.Count / $messagesWithRules)
+                    Frequency = "{0:P1}" -f ($_.Value.Count / $RuleStats.MessagesWithRules)
                     Score = [math]::Round($_.Value.Score, 2)
+                    Description = $_.Value.Description
                 }
             } |
-            Format-Table Rule, HitCount, Frequency, Score -AutoSize
+            Format-Table Rule, HitCount, Frequency, Score, Description -AutoSize
             
-        Write-Host "`nTop 25 Highest Scoring Rules:"
-        $allRuleStats.GetEnumerator() | 
+        Write-Log "`nTop 25 Highest Scoring Rules:" "Info" "White"
+        $RuleStats.AllRuleStats.GetEnumerator() | 
             Sort-Object { $_.Value.Score } -Descending | 
             Select-Object -First 25 | 
             ForEach-Object {
@@ -540,58 +637,132 @@ if($Results.Count -gt 0) {
                     Rule = $_.Key
                     Score = [math]::Round($_.Value.Score, 2)
                     HitCount = $_.Value.Count
+                    Description = $_.Value.Description
                 }
             } |
-            Format-Table Rule, Score, HitCount -AutoSize
+            Format-Table Rule, Score, HitCount, Description -AutoSize
     } else {
-        Write-Host "No SpamAssassin rules were found in the processed messages." -ForegroundColor Yellow
+        Write-Log "No SpamAssassin rules were found in the processed messages." "Warn" "Yellow"
         if($EnableDebug) {
-            Write-Host "Enable debug mode with -EnableDebug to see parsing details." -ForegroundColor Yellow
+            Write-Log "Enable debug mode with -EnableDebug to see parsing details." "Info" "Yellow"
         }
     }
-} else {
-    Write-Host "No results to display." -ForegroundColor Red
 }
 
-# Summary statistics
-$successCount = ($FinalResults | Where-Object { $_.Success }).Count
-$failCount = $FinalResults.Count - $successCount
-$totalTime = ($FinalResults | Measure-Object ProcessingTime -Sum).Sum
-$avgTime = if($FinalResults.Count -gt 0) { $totalTime / $FinalResults.Count } else { 0 }
+function Export-ResultsToCsv {
+    param($config, $FinalResults, $RuleStats)
 
-Write-Host "`n=== SUMMARY ===" -ForegroundColor Cyan
-Write-Host "Total files: $($FinalResults.Count)"
-Write-Host "Successful: $successCount" -ForegroundColor Green
-Write-Host "Failed: $failCount" -ForegroundColor Red
-Write-Host "Total processing time: $totalTime ms"
-Write-Host "Average time per file: $([math]::Round($avgTime, 2)) ms"
-Write-Host "Throughput: $([math]::Round($FinalResults.Count / ($totalTime / 1000), 2)) files/second"
+    if(-not $config.ExportCSV) {
+        Write-Log "`nCSV export disabled. Use -ExportCSV to create result files." "Info" "Gray"
+        return
+    }
 
-# Export results conditionally
-if($ExportCSV) {
     $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-    $exportDir = if($LogPath) { $LogPath } else { Get-Location }
-    $csvPath = Join-Path $exportDir "SpamResults_$timestamp.csv"
-    $FinalResults | Export-Csv -Path $csvPath -NoTypeInformation
-    Write-Host "`nDetailed results exported to: $csvPath" -ForegroundColor Green
+    $exportDir = if($config.LogPath) { $config.LogPath } else { Get-Location }
     
-    # Export rule statistics if available
-    if($allRuleStats -and $allRuleStats.Count -gt 0) {
+    # Export main results (excluding RuleHits to keep it clean)
+    $csvPath = Join-Path $exportDir "SpamResults_$timestamp.csv"
+    if ($FinalResults -and $FinalResults.Count -gt 0) {
+        $FinalResults | Select-Object * -ExcludeProperty RuleHits | Export-Csv -Path $csvPath -NoTypeInformation
+        Write-Log "`nDetailed results exported to: $csvPath" "Info" "Green"
+    } else {
+        Write-Log "`nNo results to export to CSV." "Warn" "Yellow"
+    }
+    
+    # Export detailed rule hits for each message
+    $allRulesPath = Join-Path $exportDir "AllRuleHits_$timestamp.csv"
+    $allRuleHits = @()
+    
+    foreach ($result in $FinalResults) {
+        if ($result.Success -and $result.RuleHits -and $result.RuleHits.Count -gt 0) {
+            foreach ($rule in $result.RuleHits) {
+                $allRuleHits += [PSCustomObject]@{
+                    FileName = $result.FileName
+                    MSGID = $result.MSGID
+                    OverallScore = $result.Score
+                    OverallResult = $result.Result
+                    RuleScore = [math]::Round($rule.Score, 3)
+                    RuleName = $rule.Rule
+                    RuleDescription = $rule.Description
+                    ProcessingTime = $result.ProcessingTime
+                }
+            }
+        }
+    }
+    
+    if ($allRuleHits.Count -gt 0) {
+        $allRuleHits | Sort-Object FileName, RuleScore -Descending | Export-Csv -Path $allRulesPath -NoTypeInformation
+        Write-Log "All rule hits exported to: $allRulesPath" "Info" "Green"
+        Write-Log "Total rule hits exported: $($allRuleHits.Count)" "Info" "White"
+    } else {
+        Write-Log "No rule hits to export." "Warn" "Yellow"
+    }
+    
+    # Export rule statistics summary
+    if($RuleStats.AllRuleStats -and $RuleStats.AllRuleStats.Count -gt 0) {
         $ruleStatsPath = Join-Path $exportDir "RuleStats_$timestamp.csv"
-        $allRuleStats.GetEnumerator() | 
+        $RuleStats.AllRuleStats.GetEnumerator() | 
             ForEach-Object {
                 [PSCustomObject]@{
                     Rule = $_.Key
                     HitCount = $_.Value.Count
-                    Frequency = [math]::Round(($_.Value.Count / $messagesWithRules) * 100, 2)
+                    Frequency = [math]::Round(($_.Value.Count / $RuleStats.MessagesWithRules) * 100, 2)
                     Score = [math]::Round($_.Value.Score, 3)
                     TotalScore = [math]::Round($_.Value.TotalScore, 3)
+                    Description = $_.Value.Description
                 }
             } |
             Sort-Object HitCount -Descending |
             Export-Csv -Path $ruleStatsPath -NoTypeInformation
-        Write-Host "Rule statistics exported to: $ruleStatsPath" -ForegroundColor Green
+        Write-Log "Rule statistics exported to: $ruleStatsPath" "Info" "Green"
     }
-} else {
-    Write-Host "`nCSV export disabled. Use -ExportCSV to create result files." -ForegroundColor Gray
 }
+
+function Show-Summary {
+    param($FinalResults)
+    $resultsWithProcessingTime = $FinalResults | Where-Object { $_.PSObject.Properties['ProcessingTime'] }
+    $successCount = ($FinalResults | Where-Object { $_.Success }).Count
+    $failCount = $FinalResults.Count - $successCount
+    $totalTime = if ($resultsWithProcessingTime.Count -gt 0) { ($resultsWithProcessingTime | Measure-Object ProcessingTime -Sum).Sum } else { 0 }
+    $avgTime = if($resultsWithProcessingTime.Count -gt 0) { $totalTime / $resultsWithProcessingTime.Count } else { 0 }
+
+    Write-Log "`n=== SUMMARY ===" "Info" "Cyan"
+    Write-Log "Total files: $($FinalResults.Count)" "Info" "White"
+    Write-Log "Successful: $successCount" "Info" "Green"
+    Write-Log "Failed: $failCount" "Info" "Red"
+    Write-Log "Total processing time: $totalTime ms" "Info" "White"
+    Write-Log "Average time per file: $([math]::Round($avgTime, 2)) ms" "Info" "White"
+    if ($totalTime -gt 0) {
+        Write-Log "Throughput: $([math]::Round($resultsWithProcessingTime.Count / ($totalTime / 1000), 2)) files/second" "Info" "White"
+    } else {
+        Write-Log "Throughput: N/A (no processing time data or zero total time)" "Info" "White"
+    }
+}
+
+# ---[ Main Execution ]---
+
+$config = New-Configuration -MSGPath $MSGPath -MaxConcurrentJobs $MaxConcurrentJobs -RemoteHost $RemoteHost -Port $Port -EnableDebug $EnableDebug -LogResponses $LogResponses -LogPath $LogPath -ExportCSV $ExportCSV
+
+# Remove the debug lines that were causing issues
+Show-Banner $config
+$Results = Invoke-SpamCheck -config $config -ScriptBlock $ScriptBlock
+
+if(-not $Results -or $Results.Count -eq 0) {
+    Write-Log "No results were returned from the spam check." "Warn" "Yellow"
+    return
+}
+
+# Flatten the results array
+$FinalResults = @()
+foreach ($item in $Results) {
+    if ($item -is [System.Collections.IEnumerable] -and $item -isnot [string]) {
+        $FinalResults += $item
+    } else {
+        $FinalResults += $item
+    }
+}
+
+$RuleStats = Get-RuleStatistics $FinalResults
+Show-Results $FinalResults $config.EnableDebug $RuleStats
+Show-Summary $FinalResults
+Export-ResultsToCsv $config $FinalResults $RuleStats
